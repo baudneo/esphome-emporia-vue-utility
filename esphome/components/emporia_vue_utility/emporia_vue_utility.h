@@ -119,11 +119,16 @@ class EmporiaVueUtility : public PollingComponent, public uart::UARTDevice {
     struct Ver ver;
   } input_buffer;
 
+  struct raw_buffer {
+    byte data[4096];
+  } raw_buffer;
+
   char mgm_mac_address[25] = "";
   char mgm_install_code[25] = "";
   int mgm_firmware_ver = 0;
 
   uint16_t pos = 0;
+  uint16_t inp_pos = 0;
   uint16_t data_len;
 
   time_t last_meter_reading = 0;
@@ -184,6 +189,23 @@ class EmporiaVueUtility : public PollingComponent, public uart::UARTDevice {
     return;
   }
 
+            void dump_input_buffer(bool logit) {
+                if (inp_pos > 0 && logit) {
+                    ESP_LOGE(TAG, "Input buffer content:");
+                    ESP_LOG_BUFFER_HEXDUMP(TAG, input_buffer.data, inp_pos+1, ESP_LOG_ERROR);
+                }
+                inp_pos = 0;
+                data_len = 0;
+            }
+
+            void dump_raw_buffer(bool logit) {
+                if (pos > 0 && logit) {
+                    ESP_LOGE(TAG, "Raw buffer dump:");
+                    ESP_LOG_BUFFER_HEXDUMP(TAG, raw_buffer.data, pos, ESP_LOG_ERROR);
+                }
+                data_len = 0;
+            }
+
   // Reads and logs everything from serial until it runs
   // out of data or encounters a 0x0d byte (ascii CR)
   void dump_serial_input(bool logit) {
@@ -198,6 +220,7 @@ class EmporiaVueUtility : public PollingComponent, public uart::UARTDevice {
           ESP_LOG_BUFFER_HEXDUMP(TAG, input_buffer.data, pos, ESP_LOG_ERROR);
         }
         pos = 0;
+        data_len = 0;
       } else {
         pos++;
       }
@@ -211,60 +234,88 @@ class EmporiaVueUtility : public PollingComponent, public uart::UARTDevice {
   }
 
   size_t read_msg() {
-    if (!available()) {
-      return 0;
-    }
+                if (!available()) {
+                    return 0;
+                }
+                inp_pos = 0;
+                char msg_type = 'z';
 
-    while (available()) {
-      char c = read();
-      uint16_t prev_pos = pos;
-      input_buffer.data[pos] = c;
-      pos++;
+                while (available()) {
+                    char c = read();
+                    uint16_t prev_pos = pos;
+                    raw_buffer.data[pos] = c;
+                    pos++;
 
-      switch (prev_pos) {
-        case 0:
-          if (c != 0x24) {  // 0x24 == "$", the start of a message
-            ESP_LOGE(TAG, "Invalid input at position %d: 0x%x", pos, c);
-            dump_serial_input(true);
-            pos = 0;
-            return 0;
-          }
-          break;
-        case 1:
-          if (c != 0x01) {  // 0x01 means "response"
-            ESP_LOGE(TAG, "Invalid input at position %d 0x%x", pos, c);
-            dump_serial_input(true);
-            pos = 0;
-            return 0;
-          }
-          break;
-        case 2:
-          // This is the message type byte
-          break;
-        case 3:
-          // The 3rd byte should be the data length
-          data_len = c;
-          break;
-        case sizeof(input_buffer.data) - 1:
-          ESP_LOGE(TAG, "Buffer overrun");
-          dump_serial_input(true);
-          return 0;
-        default:
-          if (pos < data_len + 5) {
-            ;
-          } else if (c == 0x0d) {  // 0x0d == "/r", which should end a message
-            return pos;
-          } else {
-            ESP_LOGE(TAG, "Invalid terminator at pos %d 0x%x", pos, c);
-            ESP_LOGE(TAG, "Following char is 0x%x", read());
-            dump_serial_input(true);
-            return 0;
-          }
-      }
-    }  // while(available())
+                    if (pos >= sizeof(raw_buffer.data)) {
+                        ESP_LOGE(TAG, "Raw buffer overrun");
+                        dump_serial_input(true);
+                        return 0;
+                    }
+                    // solves the 5th byte of  'r' type message being 0x24 sometimes
+                    if (inp_pos == 0) {
+                        if (c == 0x24) { // 0x24 == '$', start of meter response message (mostly)
+                            // ESP_LOGD(TAG, "Found start of meter response message (0x24 / '$') at pos: %d in the raw_buffer, starting to fill input_buffer", prev_pos);
+                            input_buffer.data[inp_pos] = c;
+                            inp_pos++;
+                        }
+                    } else if (inp_pos > 0) {
+                        // We're in the middle of a message
+                        input_buffer.data[inp_pos] = c;
 
-    return 0;
-  }
+                        switch (inp_pos) {
+                            case sizeof(input_buffer.data) - 1:
+                                ESP_LOGE(TAG, "Input buffer overrun");
+                                dump_input_buffer(true);
+                                dump_serial_input(true);
+                                return 0;
+
+                            case 1:
+                                if (c != 0x01) {  // 0x01 means "response"
+                                    ESP_LOGE(TAG,
+                                             "Meter Response Parse: invalid byte at position %d (0x%x) of input buffer",
+                                             inp_pos, c);
+                                    dump_input_buffer(true);
+                                    ESP_LOGE(TAG, "Position in raw buffer: %d", prev_pos);
+                                    dump_raw_buffer(true);
+                                    pos = 0;
+                                    inp_pos = 0;
+                                    return 0;
+                                }
+                                break;
+                            case 2:
+                                // This is the message type byte
+                                msg_type = c;
+                                break;
+                            case 3:
+                                // The 3rd byte should be the data length
+                                data_len = c;
+                                ESP_LOGD(TAG, "Meter response payload length: %d", data_len);
+                                break;
+
+                            default:
+                                if (inp_pos < data_len + 4) {
+                                    break;
+                                } else if (c == 0x0d) {  // 0x0d == "/r", which should end a message
+                                    // ESP_LOGD(TAG, "Found end of meter response message at pos %d", inp_pos);
+                                    return inp_pos + 1;
+                                } else {
+                                    c = read();
+                                    raw_buffer.data[pos] = c;
+                                    pos++;
+                                    ESP_LOGE(TAG, "Input buffer: invalid terminator at index %d -> 0x%x // following char: 0x%x", inp_pos, input_buffer.data[inp_pos], c);
+                                    dump_input_buffer(true);
+                                    dump_serial_input(true);
+                                    return 0;
+                                }
+                        } // switch (inp_pos)
+
+                        inp_pos++;
+
+                    } // if (inp_pos > 0)
+                }  // while(available())
+
+                return 0;
+            } // read_msg()
 
   int32_t endian_swap(uint32_t in) {
     uint32_t x = 0;
